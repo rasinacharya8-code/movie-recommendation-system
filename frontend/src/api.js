@@ -1,7 +1,8 @@
 import axios from 'axios';
 
+
 const api = axios.create({
-  baseURL: 'https://movie-recommendation-system-ny96.onrender.com',
+  baseURL: 'https://movie-recommendation-system-ny96.onrender.com/api',
   headers: {
     'Content-Type': 'application/json',
   },
