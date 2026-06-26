@@ -11,7 +11,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # IMPORTANT: In production, change this to a strong random secret and set DEBUG=False
 SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-fallback-key-CHANGE-ME')
 DEBUG = os.environ.get('DEBUG', 'True') == 'True'
-ALLOWED_HOSTS = ['localhost', '127.0.0.1', '0.0.0.0']
+ALLOWED_HOSTS = ['*']
 
 INSTALLED_APPS = [
     'django.contrib.admin',
