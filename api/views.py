@@ -1,159 +1,220 @@
-from rest_framework import viewsets, permissions, status, filters
-from rest_framework.decorators import action, api_view, permission_classes
-from rest_framework.response import Response
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth.models import User
 from django.contrib.auth import authenticate, login, logout
-from .models import Movie, Rating, Genre
-from .serializers import MovieSerializer, RatingSerializer, UserSerializer, GenreSerializer
 from django.db.models import Avg
+from django.utils import timezone
+from .models import Movie, Rating, Genre
+from django.db.models import Avg, Q
+import json
 
-class MovieViewSet(viewsets.ModelViewSet):
-    queryset = Movie.objects.all()
-    serializer_class = MovieSerializer
-    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
-    filter_backends = [filters.SearchFilter]
-    search_fields = ['title', 'description', 'genres__name']
+def movie_list(request):
+    """
+    MANUAL VIEW: Fetches all movies and calculates average ratings automatically.
+    """
+    search_query = request.GET.get('search', '')
+    
+    # 1. Base Queryset with Annotation (Optimized)
+    base_qs = Movie.objects.annotate(
+        calculated_rating=Avg('rating__rating')
+    ).prefetch_related('genres')
 
-    @action(detail=True, methods=['post'], permission_classes=[permissions.AllowAny])
-    def rate_movie(self, request, pk=None):
-        movie = self.get_object()
-        score = request.data.get('score')
-        review_text = request.data.get('review_text', '')
-        user_email = request.data.get('user_email', 'anonymous@example.com')
+    if search_query:
+        movies = base_qs.filter(title__icontains=search_query)
+    else:
+        movies = base_qs.all()
 
-        if not score:
-            return Response({'error': 'Score is required'}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Get or create user by email
-        user, created = User.objects.get_or_create(
-            email=user_email,
-            defaults={'username': user_email.split('@')[0]}
-        )
-
-        rating, created = Rating.objects.update_or_create(
-            user=user, movie=movie,
-            defaults={'score': score, 'review_text': review_text}
-        )
-        return Response(RatingSerializer(rating).data)
-
-    @action(detail=False, methods=['get'])
-    def recommendations(self, request):
-        if not request.user.is_authenticated:
-            # Default: specific popular movies if not logged in
-            return Response(MovieSerializer(Movie.objects.order_by('-id')[:5], many=True).data)
-
-        # 1. Get User's High Ratings (>= 3)
-        user_ratings = Rating.objects.filter(user=request.user, score__gte=3).select_related('movie')
-        if not user_ratings.exists():
-            # Fallback if user hasn't rated anything: Trending/Random
-            return Response(MovieSerializer(Movie.objects.order_by('?')[:5], many=True).data)
-
-        liked_movie_ids = [r.movie.id for r in user_ratings]
-        liked_movies_genres = []
-        for r in user_ratings:
-            # Create a string of genres for each liked movie, e.g. "Action Sci-Fi"
-            genres = " ".join([g.name for g in r.movie.genres.all()])
-            liked_movies_genres.append(genres)
-
-        # 2. Build Dataset of ALL Movies
-        all_movies = Movie.objects.prefetch_related('genres').all()
-        movie_data = []
-        for m in all_movies:
-            genres_str = " ".join([g.name for g in m.genres.all()])
-            movie_data.append({
-                'id': m.id,
-                'title': m.title,
-                'genres_str': genres_str,
-                'obj': m
-            })
+    data = []
+    for movie in movies:
+        # 2. Use the annotated value (No extra DB call)
+        avg_rating = movie.calculated_rating or 0
         
-        # If dataset is too small, just return random excluding seen
-        if len(movie_data) < 3:
-             watched_ids = Rating.objects.filter(user=request.user).values_list('movie_id', flat=True)
-             recs = Movie.objects.exclude(id__in=watched_ids).order_by('?')[:5]
-             return Response(MovieSerializer(recs, many=True).data)
+        movie_year = movie.release_year or "N/A"
 
-        # 3. Content-Based Filtering with Pandas & Scikit-Learn
-        import pandas as pd
-        from sklearn.feature_extraction.text import CountVectorizer
-        from sklearn.metrics.pairwise import cosine_similarity
+        data.append({
+            'id': movie.id,
+            'title': movie.title,
+            'year': movie_year,
+            'release_year': movie_year,
+            'description': movie.description,
+            'poster_url': movie.poster_url,
+            'genres': [g.name for g in movie.genres.all()],
+            'average_rating': round(avg_rating, 1),
+            'duration': movie.duration,
+            'cast': movie.cast,
+            'watch_url': movie.watch_url
+        })
+    
+    return JsonResponse(data, safe=False)
 
-        df = pd.DataFrame(movie_data)
+def movie_detail(request, pk):
+    """
+    MANUAL VIEW: Fetches a single movie with its calculated rating.
+    """
+    try:
+        # Optimized fetch with annotation
+        movie = Movie.objects.annotate(
+            calculated_rating=Avg('rating__rating')
+        ).get(pk=pk)
         
-        # Vectorize Genres
-        count = CountVectorizer(stop_words='english')
-        count_matrix = count.fit_transform(df['genres_str'])
-        
-        # Sub-logic: Find similarity between "User Profile" and All Movies
-        # We build a 'User Generic Profile' by joining all genres they liked
-        user_profile_genres = " ".join(liked_movies_genres)
-        
-        # Transform user profile using the SAME vectorizer
-        user_vector = count.transform([user_profile_genres])
-        
-        # Calculate similarity between User Profile and All Movies
-        similarity_scores = cosine_similarity(user_vector, count_matrix)
-        
-        # Get top matches
-        # similarity_scores is [[0.1, 0.5, ...]]
-        sim_scores_list = list(enumerate(similarity_scores[0]))
-        sim_scores_list = sorted(sim_scores_list, key=lambda x: x[1], reverse=True)
-        
-        # Filter out movies user already watched
-        watched_ids = set(Rating.objects.filter(user=request.user).values_list('movie_id', flat=True))
-        
-        recommendations = []
-        for i, score in sim_scores_list:
-            movie_id = df.iloc[i]['id']
-            if movie_id not in watched_ids:
-                recommendations.append(df.iloc[i]['obj'])
-                if len(recommendations) >= 5:
-                    break
-        
-        # If we still don't have enough, fill with random
-        if len(recommendations) < 5:
-            existing_ids = [m.id for m in recommendations] + list(watched_ids)
-            filler = Movie.objects.exclude(id__in=existing_ids).order_by('?')[:5-len(recommendations)]
-            recommendations.extend(filler)
+        avg_rating = movie.calculated_rating or 0
+        movie_year = movie.release_year or "N/A"
 
-        return Response(MovieSerializer(recommendations, many=True).data)
+        data = {
+            'id': movie.id,
+            'title': movie.title,
+            'year': movie_year,
+            'release_year': movie_year,
+            'description': movie.description,
+            'poster_url': movie.poster_url,
+            'genres': [g.name for g in movie.genres.all()],
+            'average_rating': round(avg_rating, 1),
+            'duration': movie.duration,
+            'cast': movie.cast,
+            'watch_url': movie.watch_url
+        }
+        return JsonResponse(data)
+    except Movie.DoesNotExist:
+        return JsonResponse({'error': 'Movie not found'}, status=404)
 
-class RatingViewSet(viewsets.ModelViewSet):
-    queryset = Rating.objects.all()
-    serializer_class = RatingSerializer
-    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+@csrf_exempt
+def register_user_manual(request):
+    """
+    MANUAL VIEW: Handles user registration without using Serializers.
+    """
+    if request.method == 'POST':
+        try:
+            body = json.loads(request.body)
+            username = body.get('username')
+            password = body.get('password')
+            email = body.get('email')
 
-    def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+            if User.objects.filter(username=username).exists():
+                return JsonResponse({'error': 'Username already exists'}, status=400)
 
-@api_view(['POST'])
-def register_user(request):
-    serializer = UserSerializer(data=request.data)
-    if serializer.is_valid():
-        serializer.save()
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            user = User.objects.create_user(username=username, password=password, email=email)
+            return JsonResponse({'message': 'User created', 'username': user.username}, status=201)
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=400)
+    return JsonResponse({'error': 'Method not allowed'}, status=405)
 
-@api_view(['POST'])
-def login_user(request):
-    username = request.data.get('username')
-    password = request.data.get('password')
-    user = authenticate(username=username, password=password)
-    if user:
-        login(request, user)
-        return Response({'message': 'Logged in successfully', 'username': user.username})
-    return Response({'error': 'Invalid credentials'}, status=status.HTTP_400_BAD_REQUEST)
+@csrf_exempt
+def login_user_manual(request):
+    """
+    MANUAL VIEW: Custom login logic.
+    """
+    if request.method == 'POST':
+        body = json.loads(request.body)
+        username = body.get('username')
+        password = body.get('password')
+        user = authenticate(username=username, password=password)
+        if user:
+            login(request, user)
+            return JsonResponse({'message': 'Welcome', 'username': user.username})
+        return JsonResponse({'error': 'Invalid credentials'}, status=400)
+    return JsonResponse({'error': 'Method not allowed'}, status=405)
 
-@api_view(['POST'])
-def logout_user(request):
+@csrf_exempt
+def logout_user_manual(request):
     logout(request)
-    return Response({'message': 'Logged out successfully'})
+    return JsonResponse({'message': 'Logged out'})
 
-@api_view(['GET'])
-@permission_classes([permissions.IsAuthenticated])
-def current_user(request):
-    return Response({
-        'id': request.user.id,
-        'username': request.user.username,
-        'email': request.user.email
-    })
+@csrf_exempt
+def rate_movie_manual(request, pk):
+    """
+    MANUAL VIEW: Handles rating and reviewing a movie.
+    Requires a Firebase UID (user_uid) to verify the caller is a real authenticated user.
+    """
+    if request.method == 'POST':
+        try:
+            movie = Movie.objects.get(pk=pk)
+            body = json.loads(request.body)
+            rating_val = body.get('rating') or body.get('score')
+            review_text = body.get('review_text', '')
+            user_email = body.get('user_email', '')
+            user_uid = body.get('user_uid', '').strip()
+
+            # Security: Reject requests that don't provide a Firebase UID
+            if not user_uid:
+                return JsonResponse({'error': 'Authentication required. Please log in.'}, status=401)
+
+            if not rating_val:
+                return JsonResponse({'error': 'Rating is required'}, status=400)
+
+            if not user_email:
+                return JsonResponse({'error': 'User email is required'}, status=400)
+
+            # Look up existing Django user by email — do NOT create ghost users
+            # Use get_or_create safely: if the user exists, reuse them;
+            # if they're new, create with a secure unusable password.
+            username_base = user_email.split('@')[0]
+            # Ensure unique username if it already belongs to a different email
+            user = None
+            try:
+                user = User.objects.get(email=user_email)
+            except User.DoesNotExist:
+                # Create a proper Django user with an unusable (not guessable) password
+                # This user can only be authenticated via Firebase
+                username = username_base
+                counter = 1
+                while User.objects.filter(username=username).exists():
+                    username = f"{username_base}_{counter}"
+                    counter += 1
+                user = User.objects.create_user(
+                    username=username,
+                    email=user_email,
+                    password=None  # Sets unusable password — cannot log in with password
+                )
+
+            is_verified = body.get('is_verified', False)
+
+            rating_obj, created = Rating.objects.update_or_create(
+                user=user, movie=movie,
+                defaults={'rating': rating_val, 'review_text': review_text, 'is_verified': is_verified}
+            )
+
+            return JsonResponse({
+                'id': rating_obj.id,
+                'rating': rating_obj.rating,
+                'review_text': rating_obj.review_text,
+                'username': user.username,
+                'message': "Review submitted successfully!"
+            })
+        except Movie.DoesNotExist:
+            return JsonResponse({'error': 'Movie not found'}, status=404)
+        except Exception as e:
+            return JsonResponse({'error': str(e)}, status=400)
+    return JsonResponse({'error': 'Method not allowed'}, status=405)
+
+
+def get_movie_reviews_manual(request, pk):
+    """
+    MANUAL VIEW: Fetches all reviews for a specific movie.
+    """
+    try:
+        movie = Movie.objects.get(pk=pk)
+        ratings = Rating.objects.filter(movie=movie).select_related('user')
+        
+        data = []
+        for r in ratings:
+            data.append({
+                'id': r.id,
+                'userId': r.user.id,
+                'userName': r.user.username,
+                'rating': r.rating,
+                'review': r.review_text,
+                'timestamp': str(r.timestamp)
+            })
+        return JsonResponse(data, safe=False)
+    except Movie.DoesNotExist:
+        return JsonResponse({'error': 'Movie not found'}, status=404)
+
+
+def get_current_user_manual(request):
+    if request.user.is_authenticated:
+        return JsonResponse({
+            'id': request.user.id,
+            'username': request.user.username,
+            'email': request.user.email
+        })
+    return JsonResponse({'error': 'Not logged in'}, status=401)

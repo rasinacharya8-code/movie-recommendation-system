@@ -7,6 +7,7 @@ import RegisterPage from './pages/RegisterPage';
 import MovieDetailPage from './pages/MovieDetailPage';
 import ProfilePage from './pages/ProfilePage';
 import SearchPage from './pages/SearchPage';
+import SyncPage from './pages/SyncPage';
 
 function App() {
   return (
@@ -19,6 +20,7 @@ function App() {
         <Route path="/movie/:id" element={<MovieDetailPage />} />
         <Route path="/profile" element={<ProfilePage />} />
         <Route path="/search" element={<SearchPage />} />
+        <Route path="/sync-db" element={<SyncPage />} />
       </Routes>
     </Router>
   );

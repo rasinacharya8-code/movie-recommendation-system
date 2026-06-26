@@ -1,9 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { useTheme } from '../context/ThemeContext';
 import { db, auth } from '../firebase';
-import { collection, addDoc, query, where, onSnapshot, serverTimestamp } from 'firebase/firestore';
+import { collection, addDoc, query, where, onSnapshot, serverTimestamp, getDocs, getDoc, doc, updateDoc } from 'firebase/firestore';
 
-const Modal = ({ isOpen, onClose, movie }) => {
+const Modal = ({ isOpen, onClose, movie, onReviewSubmitted }) => {
     const { colors } = useTheme();
     const [reviews, setReviews] = useState([]);
     const [userReview, setUserReview] = useState('');
@@ -12,26 +12,166 @@ const Modal = ({ isOpen, onClose, movie }) => {
     const [submitting, setSubmitting] = useState(false);
     const [editMode, setEditMode] = useState(false);
     const [editingReviewId, setEditingReviewId] = useState(null);
+    const [watchProgress, setWatchProgress] = useState(0);
+    const [isWatching, setIsWatching] = useState(false);
+    const [verifiedWatcher, setVerifiedWatcher] = useState(true);
+
+    useEffect(() => {
+        const style = document.createElement('style');
+        style.innerHTML = `
+            @keyframes pulse {
+                0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(147, 51, 234, 0.4); }
+                70% { transform: scale(1.05); box-shadow: 0 0 0 10px rgba(147, 51, 234, 0); }
+                100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(147, 51, 234, 0); }
+            }
+        `;
+        document.head.appendChild(style);
+        return () => document.head.removeChild(style);
+    }, []);
 
     useEffect(() => {
         if (movie && isOpen) {
-            // Clear form when opening a new movie
             setUserReview('');
             setUserRating(0);
             setHoveredStar(0);
 
-            const q = query(collection(db, 'reviews'), where('movieId', '==', String(movie.id)));
-            const unsubscribe = onSnapshot(q, (snapshot) => {
-                const reviewsData = snapshot.docs.map(doc => ({
-                    id: doc.id,
-                    ...doc.data()
-                }));
-                setReviews(reviewsData);
-            });
+            let firestoreUnsubscribe = () => { };
 
-            return () => unsubscribe();
+            const fetchAllReviews = async () => {
+                try {
+                    // Internal discovery: If modal was opened without firestore_id, try to find it
+                    let currentFirestoreId = movie.firestore_id;
+                    if (!currentFirestoreId && isNaN(parseInt(movie.id))) {
+                        currentFirestoreId = movie.id; // It's already a non-numeric (Firestore) ID
+                    } else if (!currentFirestoreId) {
+                        try {
+                            const qTitle = query(collection(db, 'movies'), where('title', '==', movie.title));
+                            const snap = await getDocs(qTitle);
+                            if (!snap.empty) {
+                                currentFirestoreId = snap.docs[0].id;
+                            }
+                        } catch (e) {
+                            console.log("Modal discovery failed", e);
+                        }
+                    }
+
+                    // Identify all possible IDs for this movie
+                    const idsToQuery = [String(movie.id)];
+                    if (currentFirestoreId && currentFirestoreId !== String(movie.id)) {
+                        idsToQuery.push(String(currentFirestoreId));
+                    }
+
+                    // 1. Setup Firestore Listener with support for multiple IDs (merged movies)
+                    const q = query(collection(db, 'reviews'), where('movieId', 'in', idsToQuery));
+
+                    firestoreUnsubscribe = onSnapshot(q, async (snapshot) => {
+                        const firestoreReviews = snapshot.docs.map(doc => ({
+                            id: doc.id,
+                            ...doc.data(),
+                            source: 'Cloud'
+                        }));
+
+                        // 2. Fetch Django Reviews
+                        let djangoReviews = [];
+                        const numericId = idsToQuery.map(val => parseInt(val)).find(val => !isNaN(val));
+
+                        if (numericId) {
+                            try {
+                                const api = (await import('../api')).default;
+                                const res = await api.get(`/movies/${numericId}/reviews/`);
+                                djangoReviews = res.data.map(r => ({ ...r, source: 'Legacy' }));
+                            } catch (err) {
+                                console.warn('Legacy reviews fetch failed', err);
+                            }
+                        }
+
+                        // 3. Merge: Combine both
+                        const allReviewsMap = new Map();
+                        djangoReviews.forEach(r => allReviewsMap.set(`django_${r.id}`, r));
+                        firestoreReviews.forEach(r => allReviewsMap.set(`fs_${r.id}`, r));
+
+                        const merged = Array.from(allReviewsMap.values()).sort((a, b) => {
+                            const dateA = new Date(a.timestamp?.seconds ? a.timestamp.seconds * 1000 : a.timestamp);
+                            const dateB = new Date(b.timestamp?.seconds ? b.timestamp.seconds * 1000 : b.timestamp);
+                            return dateB - dateA;
+                        });
+
+                        setReviews(merged);
+
+                        // Auto-verify if user already has a review for this movie
+                        const user = auth.currentUser;
+                        if (user) {
+                            const userHasReviewed = merged.some(r => r.userId === user.uid);
+                            if (userHasReviewed) {
+                                setVerifiedWatcher(true);
+                                console.log("User already reviewed this movie - auto-verified!");
+                            }
+                        }
+                    });
+                } catch (err) {
+                    console.error("Error setting up reviews", err);
+                }
+            };
+
+            fetchAllReviews();
+
+            // Fetch initial watch progress from local storage
+            const user = auth.currentUser;
+            if (user) {
+                const storageKey = `watch_seconds_${user.uid}_${movie.id}`;
+                const savedSeconds = localStorage.getItem(storageKey);
+                if (savedSeconds) {
+                    const seconds = parseFloat(savedSeconds);
+                    const progress = (seconds / ((movie.duration || 1) * 60)) * 100;
+                    setWatchProgress(Math.min(progress, 100));
+                    if (progress >= 90) setVerifiedWatcher(true);
+                }
+            }
+
+            return () => firestoreUnsubscribe();
         }
-    }, [movie, isOpen]);
+    }, [movie, isOpen, movie?.firestore_id]);
+
+    useEffect(() => {
+        let interval;
+        if (isWatching && movie && movie.duration > 0) {
+            const user = auth.currentUser;
+            if (!user) return;
+
+            if (!user.uid || !movie.id) return;
+
+            // Timestamp-based tracking
+            const storageKey = `watch_start_${user.uid}_${movie.id}`;
+            let startTime = localStorage.getItem(storageKey);
+
+            if (!startTime) {
+                console.log("Starting new watch timer for:", storageKey);
+                startTime = Date.now().toString();
+                localStorage.setItem(storageKey, startTime);
+            } else {
+                console.log("Resuming watch timer for:", storageKey, "Started at:", new Date(parseInt(startTime)).toLocaleTimeString());
+            }
+
+            const updateTracking = () => {
+                const now = Date.now();
+                const elapsedSeconds = (now - parseInt(startTime)) / 1000;
+
+                // Calculate percentage based on movie duration
+                const progress = (elapsedSeconds / (movie.duration * 60)) * 100;
+
+                setWatchProgress(Math.min(progress, 100));
+
+                if (progress >= 90) {
+                    setVerifiedWatcher(true);
+                }
+            };
+
+            // Update visible progress every second
+            interval = setInterval(updateTracking, 1000);
+            updateTracking(); // Immediate check
+        }
+        return () => clearInterval(interval);
+    }, [isWatching, movie?.id, movie?.duration, auth.currentUser?.uid]);
 
     const handleSubmitReview = async (e) => {
         e.preventDefault();
@@ -63,16 +203,38 @@ const Modal = ({ isOpen, onClose, movie }) => {
 
         setSubmitting(true);
         try {
+            // 1. Save to Django
+            console.log("Attempting Django submission from Modal...");
+            const apiInstance = (await import('../api')).default;
+            try {
+                const response = await apiInstance.post(`/movies/${movie.id}/rate_movie/`, {
+                    rating: userRating,
+                    review_text: userReview,
+                    user_email: user.email || 'anonymous@example.com',
+                    user_uid: user.uid,
+                    is_verified: verifiedWatcher
+                });
+                console.log("Django submission successful:", response.data);
+            } catch (apiErr) {
+                console.error("Django API Error:", apiErr);
+                console.error("Error response:", apiErr.response?.data);
+                const errorMsg = apiErr.response?.data?.error || 'Submission failed.';
+                alert(`❌ ${errorMsg}`);
+                setSubmitting(false);
+                return;
+            }
+
+            // 2. Save overlay to Firebase
+            console.log("Attempting Firebase submission from Modal...");
             if (editMode && editingReviewId) {
-                // Update existing review in Firebase
                 const { doc, updateDoc } = await import('firebase/firestore');
                 await updateDoc(doc(db, 'reviews', editingReviewId), {
                     rating: userRating,
                     review: userReview,
-                    timestamp: serverTimestamp()
+                    timestamp: serverTimestamp(),
+                    isVerified: verifiedWatcher
                 });
             } else {
-                // Save new review to Firebase
                 await addDoc(collection(db, 'reviews'), {
                     movieId: String(movie.id),
                     movieTitle: movie.title,
@@ -80,23 +242,55 @@ const Modal = ({ isOpen, onClose, movie }) => {
                     userName: user.displayName || user.email,
                     rating: userRating,
                     review: userReview,
-                    timestamp: serverTimestamp()
+                    timestamp: serverTimestamp(),
+                    isVerified: verifiedWatcher
                 });
             }
+            console.log("Firebase submission successful");
 
-            // Also save/update to Django for average rating calculation
+            // --- Aggregate Average Rating Update (Cloud) ---
             try {
-                const api = (await import('../api')).default;
-                await api.post(`/movies/${movie.id}/rate_movie/`, {
-                    score: userRating,
-                    review_text: userReview,
-                    user_email: user.email || 'anonymous@example.com'
-                });
-                console.log('✅ Rating saved to Django successfully');
-            } catch (apiErr) {
-                console.error('❌ Django API error:', apiErr);
-                // Continue even if Django save fails - Firebase review is saved
+                const { getDocs, query, where, updateDoc, doc } = await import('firebase/firestore');
+
+                // 1. Identify all IDs for this movie
+                const idsToQuery = [String(movie.id)];
+                if (movie.firestore_id && movie.firestore_id !== String(movie.id)) {
+                    idsToQuery.push(String(movie.firestore_id));
+                }
+
+                // 2. Fetch all reviews for these IDs
+                const reviewsSnap = await getDocs(query(
+                    collection(db, 'reviews'),
+                    where('movieId', 'in', idsToQuery)
+                ));
+                const allRatings = reviewsSnap.docs.map(d => Number(d.data().rating || 0));
+
+                if (allRatings.length > 0) {
+                    const newAverage = allRatings.reduce((a, b) => a + b, 0) / allRatings.length;
+
+                    // 3. Update the movie document in Firestore if it exists
+                    const movieDocIds = [String(movie.id)];
+                    if (movie.firestore_id) movieDocIds.push(String(movie.firestore_id));
+
+                    for (const docId of movieDocIds) {
+                        try {
+                            const movieRef = doc(db, 'movies', docId);
+                            const movieSnap = await getDoc(movieRef);
+                            if (movieSnap.exists()) {
+                                await updateDoc(movieRef, {
+                                    average_rating: newAverage,
+                                    review_count: allRatings.length
+                                });
+                            }
+                        } catch (docErr) {
+                            // Ignored
+                        }
+                    }
+                }
+            } catch (avgErr) {
+                console.warn("Aggregate rating update failed", avgErr);
             }
+            // -----------------------------------------------
 
             setUserReview('');
             setUserRating(0);
@@ -108,8 +302,12 @@ const Modal = ({ isOpen, onClose, movie }) => {
                 alert('Review submitted successfully!');
             }
 
-            // Reload page to show updated average rating
-            window.location.reload();
+            if (onReviewSubmitted) {
+                onReviewSubmitted();
+            } else {
+                // Fallback if no callback provided
+                window.location.reload();
+            }
         } catch (err) {
             console.error(err);
             alert('Failed to submit review. Please try again.');
@@ -131,6 +329,12 @@ const Modal = ({ isOpen, onClose, movie }) => {
         setEditingReviewId(null);
         setUserRating(0);
         setUserReview('');
+    };
+
+    const handleWatchClick = async () => {
+        setIsWatching(true);
+        // Inform user tracking has started
+        console.log("Watch tracking started for", movie.title);
     };
 
     if (!isOpen || !movie) return null;
@@ -380,6 +584,20 @@ const Modal = ({ isOpen, onClose, movie }) => {
             color: colors.textSecondary,
             lineHeight: '1.5',
         },
+        watchBtn: {
+            display: 'inline-flex',
+            alignItems: 'center',
+            padding: '12px 25px',
+            background: 'linear-gradient(90deg, #ff00cc, #333399)',
+            color: '#fff',
+            textDecoration: 'none',
+            borderRadius: '50px',
+            marginTop: '20px',
+            fontWeight: 'bold',
+            fontSize: '1rem',
+            boxShadow: '0 4px 15px rgba(255, 0, 204, 0.4)',
+            transition: 'transform 0.2s ease',
+        },
     };
 
     return (
@@ -397,18 +615,31 @@ const Modal = ({ isOpen, onClose, movie }) => {
                     <div style={styles.headerOverlay}>
                         <h2 style={styles.title}>{movie.title}</h2>
                         <div style={styles.metadata}>
-                            <span>{movie.release_date?.split('-')[0]}</span>
-                            {movie.average_rating && (
-                                <span style={styles.rating}>
-                                    ⭐ {movie.average_rating.toFixed(1)}
+                            <span>
+                                {movie.release_year || movie.year || (movie.release_date && movie.release_date.split('-')[0]) || 'N/A'}
+                            </span>
+                            <span style={{ margin: '0 8px', color: colors.textSecondary }}>|</span>
+                            <span>{movie.duration || 'N/A'} min</span>
+                            <span style={{ margin: '0 8px', color: colors.textSecondary }}>|</span>
+                            <div style={styles.rating}>
+                                <span style={{ color: '#ffc107' }}>★</span>
+                                <span>
+                                    {reviews.length > 0
+                                        ? (reviews.reduce((acc, r) => acc + Number(r.rating || 0), 0) / reviews.length).toFixed(1)
+                                        : (movie.average_rating !== undefined && movie.average_rating !== null
+                                            ? Number(movie.average_rating).toFixed(1)
+                                            : '0.0')}
                                 </span>
-                            )}
+                                <span style={{ fontSize: '0.7rem', marginLeft: '4px', opacity: 0.8 }}>
+                                    ({reviews.length} Ratings)
+                                </span>
+                            </div>
                         </div>
-                        {movie.genres && movie.genres.length > 0 && (
+                        {movie.genres && (Array.isArray(movie.genres) ? movie.genres : movie.genres.split(',')).length > 0 && (
                             <div style={styles.genreContainer}>
-                                {movie.genres.map((genre, idx) => (
+                                {(Array.isArray(movie.genres) ? movie.genres : movie.genres.split(',')).map((genre, idx) => (
                                     <span key={idx} style={styles.genreBadge}>
-                                        {genre.name}
+                                        {typeof genre === 'string' ? genre : genre.name}
                                     </span>
                                 ))}
                             </div>
@@ -420,17 +651,51 @@ const Modal = ({ isOpen, onClose, movie }) => {
                     {/* Description Section */}
                     <div style={styles.section}>
                         <h3 style={styles.sectionTitle}>Description</h3>
-                        <p style={styles.description}>{movie.description || 'No description available.'}</p>
+                        <p style={styles.description}>{movie.description || movie.overview || 'No description available.'}</p>
+                        {movie.duration && (
+                            <p style={{
+                                ...styles.description,
+                                marginTop: '10px',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '8px'
+                            }}>
+                                <span style={{ fontSize: '1.2rem' }}>⏱️</span>
+                                Duration: {movie.duration} minutes
+                            </p>
+                        )}
                     </div>
 
                     {/* Cast Section */}
                     <div style={styles.section}>
                         <h3 style={styles.sectionTitle}>Cast</h3>
                         <div style={styles.castGrid}>
-                            {movie.cast ? movie.cast.split(',').slice(0, 6).map((actor, idx) => (
-                                <div key={idx} style={styles.castMember}>{actor.trim()}</div>
-                            )) : <p style={styles.description}>Cast information not available.</p>}
+                            {movie.cast ? (
+                                Array.isArray(movie.cast)
+                                    ? movie.cast.slice(0, 6).map((actor, idx) => (
+                                        <div key={idx} style={styles.castMember}>{actor.trim()}</div>
+                                    ))
+                                    : movie.cast.split(',').slice(0, 6).map((actor, idx) => (
+                                        <div key={idx} style={styles.castMember}>{actor.trim()}</div>
+                                    ))
+                            ) : <p style={styles.description}>Cast information not available.</p>}
                         </div>
+                    </div>
+
+                    <div style={{ textAlign: 'center', marginBottom: '2rem' }}>
+                        <a
+                            href={movie.watch_url || `https://www.google.com/search?q=${encodeURIComponent(movie.title + " watch online streaming")}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{
+                                ...styles.watchBtn,
+                                animation: isWatching ? 'pulse 2s infinite' : 'none'
+                            }}
+                            onClick={handleWatchClick}
+                        >
+                            <span style={{ marginRight: '8px' }}>▶️</span>
+                            {movie.watch_url ? 'Watch Movie Now' : 'Find Streaming Options'}
+                        </a>
                     </div>
 
                     <div style={styles.divider}></div>
@@ -458,12 +723,40 @@ const Modal = ({ isOpen, onClose, movie }) => {
                                     value={userReview}
                                     onChange={(e) => setUserReview(e.target.value)}
                                     style={styles.textarea}
-                                    placeholder="Share your thoughts about this movie..."
+                                    placeholder={verifiedWatcher ? "Share your thoughts about this movie..." : "Please watch at least 90% of the movie to leave a review."}
                                     required
+                                    disabled={!verifiedWatcher}
                                 />
                             </label>
+                            {!verifiedWatcher && (
+                                <div style={{
+                                    background: 'rgba(255, 193, 7, 0.1)',
+                                    padding: '10px',
+                                    borderRadius: '8px',
+                                    marginTop: '10px',
+                                    fontSize: '0.85rem',
+                                    color: '#ffc107',
+                                    border: '1px solid rgba(255, 193, 7, 0.3)'
+                                }}>
+                                    ⚠️ <strong>Review Locked:</strong> You've watched {watchProgress.toFixed(1)}% of this movie.
+                                    Please watch 90% or more to submit a review.
+                                    {isWatching && (
+                                        <div style={{ marginTop: '5px', color: '#4caf50', fontSize: '0.75rem', fontWeight: 'bold' }}>
+                                            ● Watch time tracking is active...
+                                        </div>
+                                    )}
+                                </div>
+                            )}
                             <div style={{ display: 'flex', gap: '1rem' }}>
-                                <button type="submit" style={styles.submitBtn} disabled={submitting}>
+                                <button
+                                    type="submit"
+                                    style={{
+                                        ...styles.submitBtn,
+                                        opacity: (!verifiedWatcher || submitting) ? 0.6 : 1,
+                                        cursor: (!verifiedWatcher || submitting) ? 'not-allowed' : 'pointer'
+                                    }}
+                                    disabled={submitting || !verifiedWatcher}
+                                >
                                     {submitting ? (editMode ? 'Updating...' : 'Submitting...') : (editMode ? 'Update Review' : 'Submit Review')}
                                 </button>
                                 {editMode && (
@@ -482,8 +775,9 @@ const Modal = ({ isOpen, onClose, movie }) => {
                             {reviews.length > 0 ? reviews.map(review => (
                                 <div key={review.id} style={styles.reviewCard}>
                                     <div style={styles.reviewHeader}>
-                                        <span style={styles.reviewAuthor}>{review.userName}</span>
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                                            <span style={styles.reviewAuthor}>{review.userName}</span>
+                                        </div>                                        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
                                             <span style={styles.reviewRating}>
                                                 {renderStars(review.rating, false, '1rem')}
                                             </span>

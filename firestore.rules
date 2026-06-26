@@ -3,6 +3,21 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     
+    // Movies, Cast, Genres: Public read
+    // Movies: Authenticated create (for adding new movies)
+    match /movies/{movieId} {
+      allow read: if true;
+      allow write: if request.auth != null;
+    }
+    
+    match /cast/{castId} {
+      allow read: if true;
+    }
+    
+    match /genres/{genreId} {
+      allow read: if true;
+    }
+
     // Reviews: Public read, Authenticated create, Owner update/delete
     match /reviews/{reviewId} {
       allow read: if true;
@@ -10,9 +25,9 @@ service cloud.firestore {
       allow update, delete: if request.auth != null && request.auth.uid == resource.data.userId;
     }
 
-    // Default: Authenticated users can read/write everything else (e.g., user profiles, watchlists)
-    match /{document=**} {
-      allow read, write: if request.auth != null;
+    // Default: Authenticated users can read/write everything else (e.g., user profiles)
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
     }
   }
 }

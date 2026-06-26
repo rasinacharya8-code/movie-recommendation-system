@@ -30,7 +30,7 @@ export const ThemeProvider = ({ children }) => {
         toggleTheme,
         colors: {
             background: isDark ? '#121212' : '#ffffff',
-            cardBg: isDark ? 'rgba(255, 255, 255, 0.05)' : 'rgba(0, 0, 0, 0.05)',
+            cardBg: isDark ? 'rgba(246, 246, 246, 0.05)' : 'rgba(0, 0, 0, 0.05)',
             text: isDark ? '#ffffff' : '#000000',
             textSecondary: isDark ? '#aaaaaa' : '#666666',
             border: isDark ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.1)',

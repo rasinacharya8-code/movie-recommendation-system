@@ -2,8 +2,9 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import api from '../api';
 import { useTheme } from '../context/ThemeContext';
-import { auth } from '../firebase';
+import { auth, db } from '../firebase';
 import { signOut, onAuthStateChanged } from 'firebase/auth';
+import { collection, getDocs } from 'firebase/firestore';
 
 const Navbar = () => {
     const navigate = useNavigate();
@@ -51,11 +52,45 @@ const Navbar = () => {
 
     const fetchSearchResults = async () => {
         try {
-            const res = await api.get(`/movies/?search=${searchTerm}`);
-            setResults(res.data);
-            setShowDropdown(true);
+            // 1. Fetch from Firestore
+            const moviesRef = collection(db, 'movies');
+            const snapshot = await getDocs(moviesRef);
+            const firestoreMovies = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            })).filter(movie =>
+                movie.title?.toLowerCase().includes(searchTerm.toLowerCase())
+            );
+
+            // 2. Fetch from Local Django API
+            let djangoMovies = [];
+            try {
+                const res = await api.get(`/movies/?search=${searchTerm}`);
+                djangoMovies = res.data;
+            } catch (djangoErr) {
+                console.error("Django search fallback failed", djangoErr);
+            }
+
+            // 3. Merge results (Avoid duplicates by title)
+            const movieMap = new Map();
+
+            // Prioritize Django results for titles because they have calculated ratings/years
+            djangoMovies.forEach(m => movieMap.set(m.title.toLowerCase(), m));
+
+            // Add Firestore results if not already present
+            firestoreMovies.forEach(m => {
+                const key = m.title.toLowerCase();
+                if (!movieMap.has(key)) {
+                    movieMap.set(key, m);
+                }
+            });
+
+            const combinedResults = Array.from(movieMap.values());
+            setResults(combinedResults);
+            setShowDropdown(combinedResults.length > 0);
         } catch (err) {
-            console.error("Search failed", err);
+            console.error("Hybrid search failed", err);
+            setShowDropdown(false);
         }
     };
 
@@ -84,6 +119,11 @@ const Navbar = () => {
     const handleViewAll = () => {
         setShowDropdown(false);
         navigate(`/search?query=${encodeURIComponent(searchTerm)}`);
+    };
+
+    const getInitials = (name) => {
+        if (!name) return '?';
+        return name.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
     };
 
     const styles = {
@@ -218,13 +258,35 @@ const Navbar = () => {
             alignItems: 'center',
             justifyContent: 'center',
             transition: 'all 0.3s',
+        },
+        avatar: {
+            width: '35px',
+            height: '35px',
+            borderRadius: '50%',
+            background: `linear-gradient(45deg, ${colors.accent}, ${colors.accentSecondary})`,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontSize: '0.85rem',
+            color: '#fff',
+            fontWeight: '700',
+            cursor: 'pointer',
+            border: `2px solid ${colors.border}`,
+            textDecoration: 'none',
+        },
+        avatarImg: {
+            width: '35px',
+            height: '35px',
+            borderRadius: '50%',
+            objectFit: 'cover',
+            border: `2px solid ${colors.border}`,
         }
     };
 
     return (
         <nav style={styles.nav}>
-            <div style={styles.logo}>
-                <Link to="/" style={styles.link}>MovieRecs</Link>
+            <div style={{ display: 'flex', alignItems: 'center' }}>
+                <Link to="/" style={{ ...styles.logo, fontSize: '1.4rem' }}>🎬 Movie Recommendation System</Link>
             </div>
 
             <div style={styles.searchContainer} ref={searchRef}>
@@ -248,7 +310,9 @@ const Navbar = () => {
                                 <img src={movie.poster_url} alt={movie.title} style={styles.thumb} />
                                 <div style={styles.itemInfo}>
                                     <div style={styles.itemTitle}>{movie.title}</div>
-                                    <div style={styles.itemYear}>{movie.release_date?.split('-')[0]}</div>
+                                    <div style={styles.itemYear}>
+                                        {movie.release_year || movie.release_date?.split('-')[0]}
+                                    </div>
                                 </div>
                             </div>
                         ))}
@@ -266,11 +330,12 @@ const Navbar = () => {
                     {isDark ? '☀️' : '🌙'}
                 </button>
                 <Link to="/" style={styles.link}>Home</Link>
+
                 {user ? (
                     <>
-                        <span style={styles.text}>Hi, {user.displayName || user.email}</span>
-                        <Link to="/profile" style={styles.link}>Profile</Link>
+                        <span style={styles.text}>Hi, {user.displayName?.split(' ')[0] || user.email.split('@')[0]}</span>
                         <button onClick={handleLogout} style={styles.button}>Logout</button>
+                        <Link to="/profile" style={styles.link}>Profile</Link>
                     </>
                 ) : (
                     <>
@@ -279,7 +344,7 @@ const Navbar = () => {
                     </>
                 )}
             </div>
-        </nav>
+        </nav >
     );
 };
 

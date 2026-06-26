@@ -12,73 +12,83 @@ const MovieCard = ({ movie }) => {
 
     const styles = {
         card: {
-            background: colors.cardBg,
-            border: `1px solid ${colors.border}`,
+            position: 'relative',
             borderRadius: '12px',
             overflow: 'hidden',
+            backgroundColor: colors.cardBg,
+            boxShadow: '0 4px 15px rgba(0,0,0,0.2)',
             cursor: 'pointer',
-            transition: 'transform 0.3s, box-shadow 0.3s',
-            backdropFilter: 'blur(10px)',
-            transform: isHovered ? 'translateY(-8px)' : 'translateY(0)',
-            boxShadow: isHovered ? '0 12px 24px rgba(0,0,0,0.3)' : '0 4px 8px rgba(0,0,0,0.1)',
+            transition: 'transform 0.3s ease, box-shadow 0.3s ease',
+            transform: isHovered ? 'translateY(-5px)' : 'none',
+            border: `1px solid ${colors.border}`,
+            height: '100%',
+            display: 'flex',
+            flexDirection: 'column'
         },
         img: {
             width: '100%',
-            height: '270px',
+            height: '100%',
             objectFit: 'cover',
-            display: imageError ? 'none' : 'block',
+            transition: 'transform 0.5s ease',
+            transform: isHovered ? 'scale(1.05)' : 'none',
         },
         placeholder: {
             width: '100%',
-            height: '270px',
+            height: '100%',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            background: `linear-gradient(135deg, ${colors.cardBg}, ${colors.inputBg})`,
-            color: colors.textSecondary,
-            fontSize: '0.9rem',
+            backgroundColor: '#2a2a2a',
+            color: '#555',
+            fontSize: '1.2rem',
             textAlign: 'center',
-            padding: '1rem',
         },
         info: {
             padding: '1rem',
+            flex: 1,
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'space-between'
         },
         title: {
-            margin: '0 0 0.5rem 0',
             fontSize: '1rem',
             fontWeight: '600',
+            marginBottom: '0.5rem',
             color: colors.text,
-            whiteSpace: 'nowrap',
             overflow: 'hidden',
             textOverflow: 'ellipsis',
+            display: '-webkit-box',
+            WebkitLineClamp: 2,
+            WebkitBoxOrient: 'vertical',
         },
-        year: {
-            margin: '0 0 0.25rem 0',
-            fontSize: '0.85rem',
-            color: colors.textSecondary,
+        overlay: {
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: 'rgba(0, 0, 0, 0.7)',
+            backdropFilter: 'blur(4px)',
+            color: '#fff',
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'center',
+            alignItems: 'center',
+            padding: '1.5rem',
+            textAlign: 'center',
+            opacity: isHovered ? 1 : 0,
+            transition: 'opacity 0.3s ease',
+            zIndex: 2,
         },
-        rating: {
-            margin: 0,
+        descText: {
             fontSize: '0.85rem',
-            color: '#ffc107',
-            fontWeight: '600',
+            lineHeight: '1.4',
+            display: '-webkit-box',
+            WebkitLineClamp: 4,
+            WebkitBoxOrient: 'vertical',
+            overflow: 'hidden',
+            marginBottom: '1rem',
         }
-    };
-
-    const renderStars = (rating) => {
-        const stars = [];
-        // Rating is already on 5-star scale, no conversion needed
-
-        for (let i = 1; i <= 5; i++) {
-            if (i <= Math.floor(rating)) {
-                stars.push(<span key={i} style={{ color: '#ffc107' }}>★</span>);
-            } else if (i === Math.ceil(rating) && rating % 1 !== 0) {
-                stars.push(<span key={i} style={{ color: '#ffc107' }}>★</span>);
-            } else {
-                stars.push(<span key={i} style={{ color: '#555' }}>★</span>);
-            }
-        }
-        return { stars, rating };
     };
 
     return (
@@ -87,30 +97,108 @@ const MovieCard = ({ movie }) => {
             onMouseEnter={() => setIsHovered(true)}
             onMouseLeave={() => setIsHovered(false)}
         >
-            {!imageError && movie.poster_url ? (
-                <img
-                    src={movie.poster_url}
-                    alt={movie.title}
-                    style={styles.img}
-                    onError={handleImageError}
-                    referrerPolicy="no-referrer"
-                />
-            ) : (
-                <div style={styles.placeholder}>
-                    🎬<br />{movie.title}
-                </div>
-            )}
-            <div style={styles.info}>
-                <h3 style={styles.title}>{movie.title}</h3>
-                <p style={styles.year}>{movie.release_date?.split('-')[0] || 'N/A'}</p>
-                {movie.average_rating && (
-                    <div style={styles.rating}>
-                        {renderStars(movie.average_rating).stars}
-                        <span style={{ marginLeft: '0.5rem', fontSize: '0.8rem' }}>
-                            {movie.average_rating.toFixed(1)}/5
-                        </span>
+            <div style={{ position: 'relative', height: '270px', overflow: 'hidden' }}>
+                {!imageError && movie.poster_url ? (
+                    <img
+                        src={movie.poster_url}
+                        alt={movie.title}
+                        style={styles.img}
+                        onError={handleImageError}
+                        referrerPolicy="no-referrer"
+                        loading="lazy"
+                    />
+                ) : (
+                    <div style={styles.placeholder}>
+                        🎬<br />{movie.title}
                     </div>
                 )}
+                <div style={styles.overlay}>
+                    <p style={styles.descText}>
+                        {movie.description || movie.overview || 'Discover more details about this masterpiece...'}
+                    </p>
+                    <div style={{ display: 'flex', gap: '10px' }}>
+                        <span style={{
+                            fontSize: '0.8rem',
+                            padding: '6px 12px',
+                            borderRadius: '20px',
+                            background: colors.accent,
+                            boxShadow: `0 4px 10px ${colors.accent}66`
+                        }}>
+                            Details
+                        </span>
+                        <a
+                            href={movie.watch_url || `https://www.google.com/search?q=${encodeURIComponent(movie.title + " watch online streaming")}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            style={{
+                                fontSize: '0.8rem',
+                                padding: '6px 12px',
+                                borderRadius: '20px',
+                                background: 'linear-gradient(90deg, #ff00cc, #333399)',
+                                color: '#fff',
+                                textDecoration: 'none',
+                                fontWeight: 'bold'
+                            }}
+                        >
+                            ▶ Watch
+                        </a>
+                    </div>
+                </div>
+            </div>
+            <div style={styles.info}>
+                <h3 style={styles.title}>{movie.title}</h3>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginBottom: '8px' }}>
+                    {movie.genres && (Array.isArray(movie.genres) ? movie.genres : movie.genres.split(',')).slice(0, 2).map((g, i) => {
+                        const name = typeof g === 'string' ? g : g.name;
+                        return (
+                            <span key={i} style={{
+                                fontSize: '0.7rem',
+                                background: colors.accent + '22',
+                                color: colors.accent,
+                                padding: '2px 6px',
+                                borderRadius: '4px',
+                                border: `1px solid ${colors.accent}44`
+                            }}>
+                                {name}
+                            </span>
+                        );
+                    })}
+                    {movie.duration && (
+                        <span style={{
+                            fontSize: '0.7rem',
+                            color: '#aaa',
+                            padding: '2px 6px',
+                            display: 'flex',
+                            alignItems: 'center'
+                        }}>
+                            🕒 {movie.duration} min
+                        </span>
+                    )}
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.8rem' }}>
+                    <span style={{ color: colors.textSecondary }}>
+                        {movie.release_year || movie.year || (movie.release_date && movie.release_date.split('-')[0]) || 'N/A'}
+                    </span>
+                    {(() => {
+                        const rating = movie.average_rating !== undefined && movie.average_rating !== null
+                            ? movie.average_rating
+                            : movie.rating;
+
+                        if (rating !== undefined && rating !== null) {
+                            return (
+                                <>
+                                    <span style={{ color: colors.textSecondary, opacity: 0.5 }}>•</span>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#ffc107', fontWeight: '600' }}>
+                                        <span>★</span>
+                                        <span>{Number(rating).toFixed(1)}</span>
+                                    </div>
+                                </>
+                            );
+                        }
+                        return null;
+                    })()}
+                </div>
             </div>
         </div>
     );

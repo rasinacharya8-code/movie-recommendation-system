@@ -4,7 +4,7 @@ import MovieCard from '../components/MovieCard';
 import Modal from '../components/Modal';
 import { useTheme } from '../context/ThemeContext';
 import { auth, db } from '../firebase';
-import { collection, query, where, onSnapshot } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, getDocs } from 'firebase/firestore';
 import { onAuthStateChanged } from 'firebase/auth';
 
 const HomePage = () => {
@@ -13,6 +13,7 @@ const HomePage = () => {
     const [selectedMovie, setSelectedMovie] = useState(null);
     const [loading, setLoading] = useState(true);
     const [currentUser, setCurrentUser] = useState(null);
+    const [cloudStatus, setCloudStatus] = useState('online'); // 'online', 'offline', 'connecting'
     const { colors } = useTheme();
 
     useEffect(() => {
@@ -37,7 +38,7 @@ const HomePage = () => {
         );
 
         const unsubscribe = onSnapshot(reviewsQuery, (snapshot) => {
-            console.log('Reviews updated! Refreshing recommendations...');
+
             const userReviews = snapshot.docs.map(doc => doc.data());
             updateRecommendations(userReviews);
         });
@@ -46,20 +47,91 @@ const HomePage = () => {
     }, [currentUser, movies]);
 
     const fetchMovies = async () => {
+        let djangoData = [];
+        const stopInitialLoading = () => setLoading(false);
+
+        // 1. Priority: Fetch from Local Django API (Internal/SQLite)
         try {
             const res = await api.get('/movies/');
-            setMovies(res.data);
+            djangoData = res.data || [];
+            if (djangoData.length > 0) {
+                setMovies(djangoData);
+                stopInitialLoading(); // SHOW LOCAL DATA NOW
+            }
         } catch (err) {
-            console.error("Failed to fetch movies", err);
-        } finally {
-            setLoading(false);
+            console.warn("Local API unreachable", err);
+        }
+
+        // 2. Secondary: Background fetch from Cloud (Firestore) with 3s timeout
+        try {
+            setCloudStatus('connecting');
+
+            const cloudFetchPromise = (async () => {
+                const moviesRef = collection(db, 'movies');
+                const snapshot = await getDocs(moviesRef);
+                return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            })();
+
+            const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error("Cloud Timeout")), 3000)
+            );
+
+            const firestoreMovies = await Promise.race([cloudFetchPromise, timeoutPromise]);
+
+            const movieMap = new Map();
+            djangoData.forEach(m => movieMap.set(m.title.toLowerCase(), {
+                ...m,
+                // Ensure default values for visual consistency (handle null AND undefined)
+                average_rating: (m.average_rating !== undefined && m.average_rating !== null) ? m.average_rating : 0,
+                rating_count: (m.rating_count !== undefined && m.rating_count !== null) ? m.rating_count : 0
+            }));
+
+            firestoreMovies.forEach(m => {
+                const key = m.title.toLowerCase();
+                const existing = movieMap.get(key);
+                if (existing) {
+                    movieMap.set(key, {
+                        ...existing,
+                        ...m,
+                        id: existing.id,
+                        firestore_id: m.id,
+                        // Prioritize LOCAL (django) release_year
+                        release_year: existing.release_year || m.release_year || (m.release_date ? m.release_date.split('-')[0] : null),
+                        // Prioritize LOCAL (Admin) data over Cloud, so Admin edits capture immediately
+                        average_rating: (existing.average_rating !== undefined && existing.average_rating !== null && existing.average_rating > 0)
+                            ? existing.average_rating
+                            : (m.average_rating !== undefined && m.average_rating !== null ? m.average_rating : 0),
+                        rating_count: (existing.rating_count !== undefined && existing.rating_count !== null && existing.rating_count > 0)
+                            ? existing.rating_count
+                            : (m.rating_count !== undefined && m.rating_count !== null ? m.rating_count : 0)
+                    });
+                } else {
+                    movieMap.set(key, {
+                        ...m,
+                        // Ensure defaults for Cloud-only movies too
+                        average_rating: (m.average_rating !== undefined && m.average_rating !== null) ? m.average_rating : 0,
+                        rating_count: (m.rating_count !== undefined && m.rating_count !== null) ? m.rating_count : 0
+                    });
+                }
+            });
+
+            const combinedMovies = Array.from(movieMap.values());
+            setMovies(combinedMovies);
+            setCloudStatus('online');
+            stopInitialLoading();
+        } catch (fsErr) {
+            // console.log("Cloud connection skipped or timed out:", fsErr.message);
+            setCloudStatus('offline');
+            stopInitialLoading(); // Critical: ensure loading screen disappears
+            if (djangoData.length === 0) {
+                setLoading(false);
+            }
         }
     };
 
     const updateRecommendations = (userReviews) => {
         if (!movies || movies.length === 0) return;
 
-        console.log('🎬 Updating recommendations with', userReviews.length, 'reviews');
 
         if (userReviews.length === 0) {
             const sortedByRating = [...movies].sort((a, b) =>
@@ -70,17 +142,12 @@ const HomePage = () => {
         }
 
         const ratedMovieIds = userReviews.map(r => r.movieId.toString());
-        const unratedMovies = movies.filter(m => !ratedMovieIds.includes(m.id.toString()));
+        const unratedMovies = movies.filter(m => !ratedMovieIds.includes(m.id?.toString()) && !ratedMovieIds.includes(m.django_id?.toString()));
 
-        const highRatedMovies = userReviews.filter(r => r.rating >= 4);
-        const mediumRatedMovies = userReviews.filter(r => r.rating === 3);
-        const lowRatedMovies = userReviews.filter(r => r.rating <= 2);
+        const highRatedMovies = userReviews.filter(r => r.rating >= 7);
+        const mediumRatedMovies = userReviews.filter(r => r.rating >= 4 && r.rating <= 6);
+        const lowRatedMovies = userReviews.filter(r => r.rating <= 3);
 
-        console.log('📊 Ratings:', {
-            high: highRatedMovies.length,
-            medium: mediumRatedMovies.length,
-            low: lowRatedMovies.length
-        });
 
         if (highRatedMovies.length === 0) {
             const sortedByRating = [...unratedMovies].sort((a, b) =>
@@ -100,9 +167,10 @@ const HomePage = () => {
             if (movie && movie.genres) {
                 // Recency bonus: more recent reviews get slightly more weight
                 const recencyMultiplier = 1 + (index / highRatedMovies.length) * 0.3;
-                movie.genres.forEach(genre => {
-                    genreScores[genre.name] = (genreScores[genre.name] || 0) + (review.rating * 4 * recencyMultiplier);
-                    genreCount[genre.name] = (genreCount[genre.name] || 0) + 1;
+                movie.genres.forEach(g => {
+                    const name = typeof g === 'string' ? g : g.name;
+                    genreScores[name] = (genreScores[name] || 0) + (review.rating * 4 * recencyMultiplier);
+                    genreCount[name] = (genreCount[name] || 0) + 1;
                 });
             }
         });
@@ -111,8 +179,9 @@ const HomePage = () => {
         mediumRatedMovies.forEach(review => {
             const movie = movies.find(m => m.id.toString() === review.movieId.toString());
             if (movie && movie.genres) {
-                movie.genres.forEach(genre => {
-                    genreScores[genre.name] = (genreScores[genre.name] || 0) + 0.3;
+                movie.genres.forEach(g => {
+                    const name = typeof g === 'string' ? g : g.name;
+                    genreScores[name] = (genreScores[name] || 0) + 0.3;
                 });
             }
         });
@@ -121,8 +190,9 @@ const HomePage = () => {
         lowRatedMovies.forEach(review => {
             const movie = movies.find(m => m.id.toString() === review.movieId.toString());
             if (movie && movie.genres) {
-                movie.genres.forEach(genre => {
-                    genreScores[genre.name] = (genreScores[genre.name] || 0) - (5 - review.rating) * 2;
+                movie.genres.forEach(g => {
+                    const name = typeof g === 'string' ? g : g.name;
+                    genreScores[name] = (genreScores[name] || 0) - (5 - review.rating) * 2;
                 });
             }
         });
@@ -132,24 +202,26 @@ const HomePage = () => {
             genreScores[genre] > 5 && (genreCount[genre] || 0) >= 1
         );
 
-        console.log('🎭 Genre scores:', genreScores);
-        console.log('✅ Preferred genres:', preferredGenres);
 
         // STRICT FILTERING: Only recommend movies from preferred genres
         const moviesWithScores = unratedMovies
             .filter(movie => {
                 // Movie must have at least one preferred genre
                 if (!movie.genres || movie.genres.length === 0) return false;
-                return movie.genres.some(genre => preferredGenres.includes(genre.name));
+                return movie.genres.some(g => {
+                    const name = typeof g === 'string' ? g : g.name;
+                    return preferredGenres.includes(name);
+                });
             })
             .map(movie => {
                 let score = 0;
                 let matchingGenres = 0;
                 let hasNegativeGenre = false;
 
-                movie.genres.forEach(genre => {
-                    const genreScore = genreScores[genre.name] || 0;
-                    if (genreScore > 0 && preferredGenres.includes(genre.name)) {
+                movie.genres.forEach(g => {
+                    const name = typeof g === 'string' ? g : g.name;
+                    const genreScore = genreScores[name] || 0;
+                    if (genreScore > 0 && preferredGenres.includes(name)) {
                         matchingGenres++;
                         score += genreScore;
                     } else if (genreScore < -5) {
@@ -209,21 +281,46 @@ const HomePage = () => {
             recommendedMovies = [...recommendedMovies, ...additionalMovies];
         }
 
-        console.log('✅ Recommended:', recommendedMovies.length, 'movies from preferred genres only');
+        // Final Safety Net: If somehow still empty, just show top rated unrated movies
+        if (recommendedMovies.length === 0) {
+            // console.log("⚠️ Personalization yielded 0 results. Falling back to Top Rated.");
+            recommendedMovies = unratedMovies
+                .sort((a, b) => (b.average_rating || 0) - (a.average_rating || 0))
+                .slice(0, 6);
+        }
+
+
         setRecommended(recommendedMovies);
     };
 
     const fetchDefaultRecommendations = async () => {
+        // racing timeout for recommendations too
         try {
-            const res = await api.get('/movies/recommendations/');
-            setRecommended(res.data.slice(0, 6));
+            const cloudFetchPromise = (async () => {
+                const moviesRef = collection(db, 'movies');
+                const snapshot = await getDocs(moviesRef);
+                return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            })();
+
+            const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error("Cloud Timeout")), 2000)
+            );
+
+            const allMovies = await Promise.race([cloudFetchPromise, timeoutPromise]);
+            const sorted = allMovies
+                .sort((a, b) => (b.average_rating || 0) - (a.average_rating || 0))
+                .slice(0, 6);
+            setRecommended(sorted);
         } catch (err) {
-            console.error("Failed to fetch default recommendations", err);
-            if (movies.length > 0) {
-                const sortedByRating = [...movies].sort((a, b) =>
-                    (b.average_rating || 0) - (a.average_rating || 0)
-                );
-                setRecommended(sortedByRating.slice(0, 6));
+            // console.log("Using Local API for default recommendations (Offline or Slow)");
+            try {
+                const res = await api.get('/movies/recommendations/');
+                setRecommended(res.data.slice(0, 6));
+            } catch (apiErr) {
+                // If recommendations fail, just use the first few movies we already have
+                if (movies.length > 0) {
+                    setRecommended(movies.slice(0, 6));
+                }
             }
         }
     };
@@ -261,6 +358,7 @@ const HomePage = () => {
         },
         grid: {
             display: 'grid',
+            //gridTemplateColumns: 'repeat(5, 1fr)',
             gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))',
             gap: '1.5rem',
             marginBottom: '3rem',
@@ -302,11 +400,35 @@ const HomePage = () => {
                 </>
             )}
 
+            <h1 style={styles.heading}>✨ Recently Added</h1>
+            <div style={styles.grid}>
+                {[...movies]
+                    .sort((a, b) => {
+                        // Numeric ID comparison for Django movies
+                        const idA = Number(a.id) || 0;
+                        const idB = Number(b.id) || 0;
+                        return idB - idA;
+                    })
+                    .slice(0, 10)
+                    .map(movie => (
+                        <div key={movie.id} onClick={() => handleMovieClick(movie)}>
+                            <MovieCard movie={movie} />
+                        </div>
+                    ))}
+            </div>
+
             <h1 style={styles.heading}>🔥 Top Rated</h1>
             <div style={styles.grid}>
                 {movies
-                    .filter(m => m.average_rating && m.average_rating >= 4.0)
-                    .sort((a, b) => b.average_rating - a.average_rating)
+                    .filter(m => {
+                        const rating = parseFloat(m.average_rating || m.rating || 0);
+                        return rating >= 4.0;
+                    })
+                    .sort((a, b) => {
+                        const rA = parseFloat(a.average_rating || 0);
+                        const rB = parseFloat(b.average_rating || 0);
+                        return rB - rA;
+                    })
                     .slice(0, 10)
                     .map(movie => (
                         <div key={movie.id} onClick={() => handleMovieClick(movie)}>
@@ -318,7 +440,14 @@ const HomePage = () => {
             <h1 style={styles.heading}>💥 Action Movies</h1>
             <div style={styles.grid}>
                 {movies
-                    .filter(m => m.genres && m.genres.some(g => g.name === 'Action'))
+                    .filter(m => {
+                        if (!m.genres) return false;
+                        const gArr = Array.isArray(m.genres) ? m.genres : m.genres.split(',');
+                        return gArr.some(g => {
+                            const name = typeof g === 'string' ? g : g.name;
+                            return name === 'Action';
+                        });
+                    })
                     .slice(0, 10)
                     .map(movie => (
                         <div key={movie.id} onClick={() => handleMovieClick(movie)}>
@@ -330,7 +459,14 @@ const HomePage = () => {
             <h1 style={styles.heading}>😂 Comedy Hits</h1>
             <div style={styles.grid}>
                 {movies
-                    .filter(m => m.genres && m.genres.some(g => g.name === 'Comedy'))
+                    .filter(m => {
+                        if (!m.genres) return false;
+                        const gArr = Array.isArray(m.genres) ? m.genres : m.genres.split(',');
+                        return gArr.some(g => {
+                            const name = typeof g === 'string' ? g : g.name;
+                            return name === 'Comedy';
+                        });
+                    })
                     .slice(0, 10)
                     .map(movie => (
                         <div key={movie.id} onClick={() => handleMovieClick(movie)}>
@@ -342,7 +478,14 @@ const HomePage = () => {
             <h1 style={styles.heading}>🎭 Critical Dramas</h1>
             <div style={styles.grid}>
                 {movies
-                    .filter(m => m.genres && m.genres.some(g => g.name === 'Drama'))
+                    .filter(m => {
+                        if (!m.genres) return false;
+                        const gArr = Array.isArray(m.genres) ? m.genres : m.genres.split(',');
+                        return gArr.some(g => {
+                            const name = typeof g === 'string' ? g : g.name;
+                            return name === 'Drama';
+                        });
+                    })
                     .slice(0, 10)
                     .map(movie => (
                         <div key={movie.id} onClick={() => handleMovieClick(movie)}>
@@ -360,7 +503,12 @@ const HomePage = () => {
                 ))}
             </div>
 
-            <Modal isOpen={!!selectedMovie} onClose={closeModal} movie={selectedMovie} />
+            <Modal
+                isOpen={!!selectedMovie}
+                onClose={closeModal}
+                movie={selectedMovie}
+                onReviewSubmitted={fetchMovies}
+            />
         </div>
     );
 };

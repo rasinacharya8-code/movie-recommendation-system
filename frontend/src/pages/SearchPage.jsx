@@ -1,12 +1,15 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import { collection, getDocs } from 'firebase/firestore';
+import { db } from '../firebase';
 import api from '../api';
 import { useTheme } from '../context/ThemeContext';
+import MovieCard from '../components/MovieCard';
 import Modal from '../components/Modal';
 
 const SearchPage = () => {
     const [searchParams] = useSearchParams();
-    const query = searchParams.get('query');
+    const queryStr = searchParams.get('query') || '';
     const [results, setResults] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
@@ -15,21 +18,78 @@ const SearchPage = () => {
     const [hoveredCard, setHoveredCard] = useState(null);
 
     useEffect(() => {
-        if (query) {
+        if (queryStr) {
             fetchResults();
         }
-    }, [query]);
+    }, [queryStr]);
 
     const fetchResults = async () => {
         setLoading(true);
         setError(null);
+        let djangoResults = [];
+
+        // 1. Priority: Local Django Search (Internal/SQLite)
+        // Works offline and provides fast results from core catalog
         try {
-            const res = await api.get(`/movies/?search=${query}`);
-            setResults(Array.isArray(res.data) ? res.data : []);
+            const res = await api.get(`/movies/?search=${queryStr}`);
+            // Normalize Django results immediately (Handle null AND undefined)
+            djangoResults = Array.isArray(res.data) ? res.data.map(m => ({
+                ...m,
+                average_rating: (m.average_rating !== undefined && m.average_rating !== null) ? m.average_rating : 0
+            })) : [];
+            setResults(djangoResults); // Show local results immediately
+            setLoading(false);         // Stop loading spinner
+        } catch (djangoErr) {
+            console.warn("Local search failed or Django server is down", djangoErr);
+        }
+
+        // 2. Secondary: Cloud Search (Firestore)
+        // Fetched in background to enrich results with user-added movies
+        try {
+            const moviesRef = collection(db, 'movies');
+            const snapshot = await getDocs(moviesRef);
+            const firestoreMovies = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            })).filter(movie => {
+                const titleMatch = movie.title?.toLowerCase().includes(queryStr.toLowerCase());
+                const genreMatch = movie.genres?.some(g => {
+                    const name = typeof g === 'string' ? g : g.name;
+                    return name?.toLowerCase().includes(queryStr.toLowerCase());
+                });
+                return titleMatch || genreMatch;
+            });
+
+            // Merge logic (runs in background)
+            const movieMap = new Map();
+            djangoResults.forEach(m => movieMap.set(m.title.toLowerCase(), m));
+
+            firestoreMovies.forEach(m => {
+                const key = m.title.toLowerCase();
+                const existing = movieMap.get(key);
+                if (existing) {
+                    movieMap.set(key, {
+                        ...existing,
+                        ...m,
+                        id: existing.id,
+                        firestore_id: m.id
+                    });
+                } else {
+                    movieMap.set(key, {
+                        ...m,
+                        // Ensure defaults for Cloud-only movies too (Handle null)
+                        average_rating: (m.average_rating !== undefined && m.average_rating !== null) ? m.average_rating : 0
+                    });
+                }
+            });
+
+            const combinedResults = Array.from(movieMap.values());
+            setResults(combinedResults);
         } catch (err) {
-            console.error('Search error:', err);
-            setError('Failed to fetch search results');
-            setResults([]);
+            // console.log("Cloud search failed", err);
+            if (djangoResults.length === 0) {
+                setError('Could not fetch results. Please check your connection.');
+            }
         } finally {
             setLoading(false);
         }
@@ -60,50 +120,9 @@ const SearchPage = () => {
         },
         grid: {
             display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))',
+            gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',
             gap: '1.5rem',
             width: '100%',
-        },
-        card: {
-            background: colors.cardBg,
-            border: `1px solid ${colors.border}`,
-            borderRadius: '12px',
-            overflow: 'hidden',
-            cursor: 'pointer',
-            transition: 'transform 0.3s, box-shadow 0.3s',
-            backdropFilter: 'blur(10px)',
-        },
-        cardHover: {
-            transform: 'translateY(-8px)',
-            boxShadow: '0 12px 24px rgba(0,0,0,0.3)',
-        },
-        poster: {
-            width: '100%',
-            height: '270px',
-            objectFit: 'cover',
-        },
-        info: {
-            padding: '1rem',
-        },
-        movieTitle: {
-            margin: '0 0 0.5rem 0',
-            fontSize: '1rem',
-            fontWeight: '600',
-            color: colors.text,
-            whiteSpace: 'nowrap',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-        },
-        year: {
-            margin: '0 0 0.25rem 0',
-            fontSize: '0.85rem',
-            color: colors.textSecondary,
-        },
-        rating: {
-            margin: 0,
-            fontSize: '0.85rem',
-            color: '#ffc107',
-            fontWeight: '600',
         },
         loading: {
             textAlign: 'center',
@@ -132,7 +151,7 @@ const SearchPage = () => {
 
     return (
         <div style={styles.container}>
-            <h2 style={styles.title}>Search Results for "{query}"</h2>
+            <h2 style={styles.title}>Search Results for "{queryStr}"</h2>
 
             {loading ? (
                 <div style={styles.loading}>Searching...</div>
@@ -145,35 +164,15 @@ const SearchPage = () => {
                     </div>
                     <div style={styles.grid}>
                         {results.map(movie => (
-                            <div
-                                key={movie.id}
-                                style={{
-                                    ...styles.card,
-                                    ...(hoveredCard === movie.id ? styles.cardHover : {})
-                                }}
-                                onClick={() => handleMovieClick(movie)}
-                                onMouseEnter={() => setHoveredCard(movie.id)}
-                                onMouseLeave={() => setHoveredCard(null)}
-                            >
-                                <img
-                                    src={movie.poster_url || 'https://via.placeholder.com/200x300?text=No+Image'}
-                                    alt={movie.title}
-                                    style={styles.poster}
-                                />
-                                <div style={styles.info}>
-                                    <h3 style={styles.movieTitle}>{movie.title}</h3>
-                                    <p style={styles.year}>{movie.release_date?.split('-')[0] || 'N/A'}</p>
-                                    {movie.average_rating && (
-                                        <p style={styles.rating}>⭐ {movie.average_rating.toFixed(1)}</p>
-                                    )}
-                                </div>
+                            <div key={movie.id} onClick={() => handleMovieClick(movie)}>
+                                <MovieCard movie={movie} />
                             </div>
                         ))}
                     </div>
                 </>
             ) : (
                 <div style={styles.noResults}>
-                    No movies found for "{query}". Try a different search term.
+                    No movies found for "{queryStr}". Try a different search term.
                 </div>
             )}
 

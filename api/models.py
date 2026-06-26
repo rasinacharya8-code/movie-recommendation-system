@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import User
 from django.core.validators import MinValueValidator, MaxValueValidator
+from django.utils import timezone
 
 class Genre(models.Model):
     name = models.CharField(max_length=100)
@@ -9,12 +10,13 @@ class Genre(models.Model):
         return self.name
 
 class Movie(models.Model):
-    tmdb_id = models.IntegerField(unique=True, null=True, blank=True)
     title = models.CharField(max_length=200)
     description = models.TextField()
     cast = models.TextField(blank=True, help_text="Comma-separated list of main actors")
-    release_date = models.DateField(null=True, blank=True)
+    release_year = models.IntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
     poster_url = models.URLField(null=True, blank=True)
+    duration = models.IntegerField(null=True, blank=True, help_text="Runtime in minutes", validators=[MinValueValidator(1)])
+    watch_url = models.URLField(null=True, blank=True, help_text="Official link to watch the movie")
     genres = models.ManyToManyField(Genre)
     
     def __str__(self):
@@ -23,12 +25,14 @@ class Movie(models.Model):
 class Rating(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     movie = models.ForeignKey(Movie, on_delete=models.CASCADE)
-    score = models.IntegerField(validators=[MinValueValidator(1), MaxValueValidator(5)])
+    rating = models.IntegerField(validators=[MinValueValidator(1), MaxValueValidator(10)])
     review_text = models.TextField(blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    is_verified = models.BooleanField(default=False)
 
     class Meta:
         unique_together = ('user', 'movie')
 
     def __str__(self):
-        return f"{self.user.username} - {self.movie.title}: {self.score}"
+        return f"{self.user.username} - {self.movie.title}: {self.rating}"
+
