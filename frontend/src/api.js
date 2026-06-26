@@ -1,10 +1,10 @@
 import axios from 'axios';
 
 const api = axios.create({
-    baseURL: '/api',
-    headers: {
-        'Content-Type': 'application/json',
-    },
+  baseURL: 'https://movie-recommendation-system-ny96.onrender.com',
+  headers: {
+    'Content-Type': 'application/json',
+  },
 });
 
 // Axios instance for backend API calls.
